@@ -66,6 +66,41 @@ struct Ticker {
     }
 };
 
+struct Base {
+    TickerInfo* info;
+
+    Base(TickerInfo& info) : info(&info) {
+        info.constructed++;
+    }
+
+    virtual ~Base() {
+        info->destroyed++;
+    }
+
+    virtual void Write(std::string& out) const {
+        out += "Base";
+    }
+};
+
+struct Derived final : Base {
+    TickerInfo* info;
+
+    Derived(TickerInfo& derivedInfo, TickerInfo& baseInfo) : Base(baseInfo), info(&derivedInfo) {
+        derivedInfo.constructed++;
+    }
+
+    virtual ~Derived() {
+        info->destroyed++;
+    }
+
+    void Write(std::string& out) const override {
+        Base::Write(out);
+        out += "Derived";
+    }
+};
+
+struct Unrelated { };
+
 template<int N = 1>
 constexpr TickerInfo constructed {
     .constructed = N

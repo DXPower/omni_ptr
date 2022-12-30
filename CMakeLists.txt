@@ -59,6 +59,8 @@ add_executable(tests)
 
 target_sources(tests PRIVATE
   tests/BasicUse.cpp
+  tests/Conversions.cpp
+  tests/Inheritance.cpp
   tests/Weaks.cpp
 )
 

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "DxPtr.hpp"
 #include <compare>
 #include <crtdbg.h>
 #include <cstddef>
@@ -20,6 +21,10 @@
 // #else
 // #define DXPTR_NOMSVC_CONSTEXPR constexpr
 // #endif
+
+#define OMNI_PTR_ERROR_COPY_CONVERT_OWNING \
+    "Can only use copying conversion functions with non-owning omni_ptrs. " \
+    "(did you mean to use std::move or omni_view/omni_ref?)"
 
 namespace DxPtr {
     namespace detail {
@@ -93,12 +98,12 @@ namespace DxPtr {
         }
     }
 
-    template<typename T, typename AlignmentP>
+    template<typename T, typename AP>
     class omni_ptr;
 
-    template<typename T, typename AlignmentP, typename... Args>
+    template<typename T, typename AP, typename... Args>
     requires DxPtr::detail::correct_constructor_args<T, Args...>
-    omni_ptr<T, AlignmentP> make_omni(Args&&... args);
+    omni_ptr<T, AP> make_omni(Args&&... args);
 
     namespace detail { 
         class omni_block_base {
@@ -155,10 +160,10 @@ namespace DxPtr {
               typename T
             , bool IsConjoined = false
             , typename Deleter = std::default_delete<T>
-            , typename AlignmentP = AlignmentPolicy::Default
+            , typename AP = AlignmentPolicy::Default
         >
         requires 
-                AlignmentPolicy::interface<T, AlignmentP>
+                AlignmentPolicy::interface<T, AP>
             and (std::is_same_v<Deleter, std::default_delete<T>> or std::is_rvalue_reference_v<Deleter>)
         class omni_block final : Deleter, public omni_block_base {
             static constexpr bool IsDefaultDeleter = std::is_same_v<Deleter, std::default_delete<T>>;
@@ -181,11 +186,11 @@ namespace DxPtr {
                 }
 
                 constexpr std::size_t get_stored_size() const { 
-                    return AlignmentPolicy::get_stored_size<T, AlignmentP>();
+                    return AlignmentPolicy::get_stored_size<T, AP>();
                 }
 
                 constexpr std::align_val_t get_stored_alignment() const {
-                    return AlignmentP{}.template get_alignment<T>();
+                    return AP{}.template get_alignment<T>();
                 }
 
                 #ifdef _DEBUG
@@ -229,7 +234,7 @@ namespace DxPtr {
             // depending on alignment
             static constexpr allocation get_conjoined_buffer_info() {
                 auto alignControl = static_cast<std::align_val_t>(alignof(omni_block));
-                auto alignT = AlignmentP{}.template get_alignment<T>();
+                auto alignT = AP{}.template get_alignment<T>();
                 auto alignTarget = std::max(alignControl, alignT);
 
                 std::size_t controlRegionSize, storedRegionSize;
@@ -237,7 +242,7 @@ namespace DxPtr {
 
                 if (alignControl >= alignT) {
                     // Case 1: Region 1 is Control block
-                    storedRegionSize = AlignmentPolicy::get_stored_size<T, AlignmentP>();
+                    storedRegionSize = AlignmentPolicy::get_stored_size<T, AP>();
                     controlRegionSize = round_up_to_nearest_multiple(
                           sizeof(omni_block)
                         , (std::size_t) alignT
@@ -250,7 +255,7 @@ namespace DxPtr {
                     // get_stored_size may add padding if the stored type
                     // is an array
                     storedRegionSize = round_up_to_nearest_multiple(
-                          AlignmentPolicy::get_stored_size<T, AlignmentP>()
+                          AlignmentPolicy::get_stored_size<T, AP>()
                         , (std::size_t) alignControl
                     );
                     controlRegionSize = sizeof(omni_block);
@@ -322,22 +327,25 @@ namespace DxPtr {
         template<typename T>
         struct weak_type_alias_provider<false, T> { };
 
-        template<typename T, bool IsOwning, typename AlignmentP = AlignmentPolicy::Default>
-        requires AlignmentPolicy::interface<T, AlignmentP>
-        class omni_ptr : public weak_type_alias_provider<IsOwning, omni_ptr<T, false, AlignmentP>> {
+        template<typename T, bool IsOwning, typename AP = AlignmentPolicy::Default>
+        requires AlignmentPolicy::interface<T, AP>
+        class omni_ptr : public weak_type_alias_provider<IsOwning, omni_ptr<T, false, AP>> {
             public:
             using pointer = T*;
             using element_type = std::remove_extent_t<T>;
+            constexpr static bool is_owning = IsOwning;
+
             private:
             using control_base_t = omni_block_base;
 
             template<bool IsConjoined = false, typename Deleter = std::default_delete<T>>
-            using control_t = omni_block<T, IsConjoined, Deleter, AlignmentP>;
+            using control_t = omni_block<T, IsConjoined, Deleter, AP>;
 
             T* data;
             control_base_t* control;
 
             // Basic constructor
+            protected:
             constexpr omni_ptr(T* ptr, control_base_t* control) : data(ptr), control(control) {
                 // log_creation();
             }
@@ -413,18 +421,18 @@ namespace DxPtr {
             }
 
             // Non-owning copy construct from owner or convertible pointer
-            template<typename Y, bool IsOwning2, typename AlignmentP2>
+            template<typename Y, bool IsOwning2, typename AP2>
             requires (not IsOwning and std::convertible_to<Y*, T*>)
-            omni_ptr(const omni_ptr<Y, IsOwning2, AlignmentP2>& owner) noexcept
-            : omni_ptr(owner.data, owner.control) {
+            omni_ptr(const omni_ptr<Y, IsOwning2, AP2>& copy) noexcept
+            : omni_ptr(copy.data, copy.control) {
                 if (control != nullptr)
                     control->increment();
             }
 
             // Non-owning copy assignment from owner or convertible pointer
-            template<typename Y, bool IsOwning2, typename AlignmentP2>
+            template<typename Y, bool IsOwning2, typename AP2>
             requires (not IsOwning and std::convertible_to<Y*, T*>)
-            omni_ptr& operator=(const omni_ptr<Y, IsOwning2, AlignmentP2>& copy) {
+            omni_ptr& operator=(const omni_ptr<Y, IsOwning2, AP2>& copy) {
                 if (this == &copy)
                     return *this;
 
@@ -436,6 +444,27 @@ namespace DxPtr {
 
                 if (control != nullptr)
                     control->increment();
+
+                return *this;
+            }
+
+            // Move construct owning from owning convertible omni_ptr
+            template<typename Y, typename AP2>
+            requires (IsOwning and std::convertible_to<Y*, T*>)
+            omni_ptr(omni_ptr<Y, true, AP2>&& move) noexcept
+            : omni_ptr(move.data, move.control) {
+                move.data = nullptr;
+                move.control = nullptr;
+            }
+
+            // Move assign owning from owning convertible omni_ptr
+            template<typename Y, typename AP2>
+            requires (IsOwning and std::convertible_to<Y*, T*>)
+            omni_ptr& operator=(omni_ptr<Y, true, AP2>&& move) noexcept {
+                if (this == &move)
+                    return *this;
+
+                swap(move);
 
                 return *this;
             }
@@ -521,13 +550,22 @@ namespace DxPtr {
                 return data != nullptr;
             }
 
-            template<typename T2, bool IsOwning2, typename AlignmentP2>
-            requires AlignmentPolicy::interface<T2, AlignmentP2>
-            friend class DxPtr::detail::omni_ptr;
+            template<typename T2, bool IsOwning2, typename AP2>
+            requires AlignmentPolicy::interface<T2, AP2>
+            friend class detail::omni_ptr;
 
-            template<typename T2, typename AlignmentP2, typename... Args>
-            requires DxPtr::detail::correct_constructor_args<T2, Args...>
-            friend DxPtr::omni_ptr<T2, AlignmentP2> DxPtr::make_omni(Args&&... args);
+            template<typename T2, typename AP2, typename... Args>
+            requires detail::correct_constructor_args<T2, Args...>
+            friend DxPtr::omni_ptr<T2, AP2> DxPtr::make_omni(Args&&... args);
+
+            template<typename Ptr, typename T2>
+            friend Ptr make_omni_ptr_raw(T2*, omni_block_base*);
+            
+            template<typename Ptr>
+            friend void set_omni_ptr_null_raw(Ptr& omni);
+
+            template<typename T2, bool O2, typename AP2>
+            friend control_base_t* get_control_block(const detail::omni_ptr<T2, O2, AP2>&);
         };
 
         template<typename U, bool O1, typename A, typename V, bool O2, typename B>
@@ -565,41 +603,213 @@ namespace DxPtr {
             out << rhs.get();
             return out;
         }
+
+        template<typename Ptr, typename T>
+        Ptr make_omni_ptr_raw(T* ptr, omni_block_base* control) {
+            return Ptr(ptr, control);
+        }
+
+        template<typename Ptr>
+        void set_omni_ptr_null_raw(Ptr& omni) {
+            omni.data = nullptr;
+            omni.control = nullptr;
+        }
+
+        template<typename T, bool O, typename AP>
+        omni_block_base* get_control_block(const detail::omni_ptr<T, O, AP>& omni) {
+            return omni.control;
+        }
     }
 
-    template<typename T, typename AlignmentP = AlignmentPolicy::Default>
-    class omni_ptr : public detail::omni_ptr<T, true, AlignmentP> {
-        using detail::omni_ptr<T, true, AlignmentP>::omni_ptr;
+    template<typename T, typename AP = AlignmentPolicy::Default>
+    class omni_ptr : public detail::omni_ptr<T, true, AP> {
+        using detail::omni_ptr<T, true, AP>::omni_ptr;
     };
 
     template<typename T>
     omni_ptr(T*) -> omni_ptr<T>;
 
-    template<typename T, typename AlignmentP = AlignmentPolicy::Default>
-    class omni_view : public detail::omni_ptr<const T, false, AlignmentP> {
-        using detail::omni_ptr<const T, false, AlignmentP>::omni_ptr;
+    template<typename T, typename AP = AlignmentPolicy::Default>
+    class omni_view : public detail::omni_ptr<const T, false, AP> {
+        using detail::omni_ptr<const T, false, AP>::omni_ptr;
     };
 
-    template<typename T, typename AlignmentP = AlignmentPolicy::Default>
-    omni_view(omni_ptr<T, AlignmentP>) -> omni_view<T, AlignmentP>;
+    template<typename T, typename AP = AlignmentPolicy::Default>
+    omni_view(omni_ptr<T, AP>) -> omni_view<T, AP>;
 
-    template<typename T, typename AlignmentP = AlignmentPolicy::Default>
-    class omni_ref : public detail::omni_ptr<T, false, AlignmentP> {
-        using detail::omni_ptr<T, false, AlignmentP>::omni_ptr;
+    template<typename T, typename AP = AlignmentPolicy::Default>
+    class omni_ref : public detail::omni_ptr<T, false, AP> {
+        using detail::omni_ptr<T, false, AP>::omni_ptr;
     };
 
-    template<typename T, typename AlignmentP = AlignmentPolicy::Default>
-    omni_ref(omni_ptr<T, AlignmentP>) -> omni_ref<T, AlignmentP>;
+    template<typename T, typename AP = AlignmentPolicy::Default>
+    omni_ref(omni_ptr<T, AP>) -> omni_ref<T, AP>;
     
-    template<typename T, typename AlignmentP = AlignmentPolicy::Default, typename... Args>
+    namespace detail {
+        template<template<typename, typename> typename Ptr, typename T, typename AP>
+        concept IsOmni = 
+               std::is_same_v<Ptr<T, AP>, DxPtr::omni_ptr<T, AP>> 
+            or std::is_same_v<Ptr<T, AP>, DxPtr::omni_view<T, AP>> 
+            or std::is_same_v<Ptr<T, AP>, DxPtr::omni_ref<T, AP>>;
+
+        template<template<typename, typename> typename Ptr, typename T, typename AP>
+        concept IsWeakOmni = 
+               std::is_same_v<Ptr<T, AP>, DxPtr::omni_view<T, AP>> 
+            or std::is_same_v<Ptr<T, AP>, DxPtr::omni_ref<T, AP>>;
+
+    }
+
+    template<typename T, typename AP = AlignmentPolicy::Default, typename... Args>
     requires detail::correct_constructor_args<T, Args...>
-    omni_ptr<T, AlignmentP> make_omni(Args&&... args) {
-        using omni_ptr_t = omni_ptr<T, AlignmentP>;
+    omni_ptr<T, AP> make_omni(Args&&... args) {
+        using omni_ptr_t = omni_ptr<T, AP>;
         using control_t = typename omni_ptr_t::template control_t<true>;
 
         auto* omni_block = control_t::template make_conjoined(std::forward<Args>(args)...);
 
         return omni_ptr_t(omni_block->get(), omni_block);
+    }
+
+    template<typename T, template<typename, typename> typename Ptr, typename U, typename AP>
+    Ptr<T, AP> static_pointer_cast(const Ptr<U, AP>& other) {
+        static_assert(detail::IsWeakOmni<Ptr, U, AP>, OMNI_PTR_ERROR_COPY_CONVERT_OWNING);
+
+        if (not other)
+            return {};
+
+        auto* ptr = static_cast<typename Ptr<T, AP>::element_type*>(other.get());
+        auto* control = get_control_block(other);
+
+        control->increment();
+
+        return detail::make_omni_ptr_raw<Ptr<T, AP>>(ptr, control);
+    }
+
+    template<typename T, template<typename, typename> typename Ptr, typename U, typename AP>
+    requires detail::IsOmni<Ptr, U, AP>
+    Ptr<T, AP> static_pointer_cast(Ptr<U, AP>&& other) {
+        if (not other)
+            return {};
+
+        auto* ptr = static_cast<typename Ptr<T, AP>::element_type*>(other.get());
+        auto* control = detail::get_control_block(other);
+
+        detail::set_omni_ptr_null_raw(other);
+
+        return detail::make_omni_ptr_raw<Ptr<T, AP>>(ptr, control);
+    }
+
+    template<typename T, template<typename, typename> typename Ptr, typename U, typename AP>
+    Ptr<T, AP> dynamic_pointer_cast(const Ptr<U, AP>& other) {
+        static_assert(detail::IsWeakOmni<Ptr, U, AP>, OMNI_PTR_ERROR_COPY_CONVERT_OWNING);
+
+        if constexpr (not std::is_class_v<T>) 
+            return {};
+        else {
+            auto* ptr = dynamic_cast<typename Ptr<T, AP>::element_type*>(other.get());
+
+            if (ptr == nullptr)
+                return {};
+
+            auto* control = detail::get_control_block(other);
+
+            control->increment();
+            
+            return detail::make_omni_ptr_raw<Ptr<T, AP>>(ptr, control);
+        }
+    }
+
+    template<typename T, template<typename, typename> typename Ptr, typename U, typename AP>
+    requires detail::IsOmni<Ptr, U, AP>
+    Ptr<T, AP> dynamic_pointer_cast(Ptr<U, AP>&& other) {
+        if constexpr (not std::is_class_v<T>) 
+            return {};
+        else {
+            auto* ptr = dynamic_cast<typename Ptr<T, AP>::element_type*>(other.get());
+
+            if (ptr == nullptr)
+                return {};
+
+            auto* control = detail::get_control_block(other);
+
+            detail::set_omni_ptr_null_raw(other);
+            
+            return detail::make_omni_ptr_raw<Ptr<T, AP>>(ptr, control);
+        }
+    }
+
+    template<typename T, template<typename, typename> typename Ptr, typename U, typename AP>
+    auto const_pointer_cast(const Ptr<U, AP>& other) {
+        static_assert(detail::IsWeakOmni<Ptr, U, AP>, OMNI_PTR_ERROR_COPY_CONVERT_OWNING);
+        
+        using ResultPtr = std::conditional_t<
+              std::is_const_v<T>
+            , omni_view<std::remove_const_t<T>>
+            , omni_ref<T>
+        >;
+        
+        if (not other)
+            return ResultPtr{};
+
+        auto* ptr = const_cast<typename ResultPtr::element_type*>(other.get());
+        auto* control = get_control_block(other);
+
+        control->increment();
+
+        return detail::make_omni_ptr_raw<ResultPtr>(ptr, control);
+    }
+
+    template<typename T, template<typename, typename> typename Ptr, typename U, typename AP>
+    requires detail::IsOmni<Ptr, U, AP>
+    auto const_pointer_cast(Ptr<U, AP>&& other) {
+        using ResultPtr = std::conditional_t<
+              detail::IsWeakOmni<Ptr, U, AP>
+            , std::conditional_t<
+                  std::is_const_v<T>
+                , omni_view<std::remove_const_t<T>>
+                , omni_ref<T>
+            >
+            , omni_ptr<T>
+        >;
+
+        if (not other)
+            return ResultPtr{};
+
+        auto* ptr = const_cast<typename ResultPtr::element_type*>(other.get());
+        auto* control = detail::get_control_block(other);
+
+        detail::set_omni_ptr_null_raw(other);
+
+        return detail::make_omni_ptr_raw<ResultPtr>(ptr, control);
+    }
+
+    template<typename T, template<typename, typename> typename Ptr, typename U, typename AP>
+    Ptr<T, AP> reinterpret_pointer_cast(const Ptr<U, AP>& other) {
+        static_assert(detail::IsWeakOmni<Ptr, U, AP>, OMNI_PTR_ERROR_COPY_CONVERT_OWNING);
+
+        if (not other)
+            return {};
+
+        auto* ptr = reinterpret_cast<typename Ptr<T, AP>::element_type*>(other.get());
+        auto* control = get_control_block(other);
+
+        control->increment();
+
+        return detail::make_omni_ptr_raw<Ptr<T, AP>>(ptr, control);
+    }
+
+    template<typename T, template<typename, typename> typename Ptr, typename U, typename AP>
+    requires detail::IsOmni<Ptr, U, AP>
+    Ptr<T, AP> reinterpret_pointer_cast(Ptr<U, AP>&& other) {
+        if (not other)
+            return {};
+        
+        auto* ptr = reinterpret_cast<typename Ptr<T, AP>::element_type*>(other.get());
+        auto* control = detail::get_control_block(other);
+
+        detail::set_omni_ptr_null_raw(other);
+
+        return detail::make_omni_ptr_raw<Ptr<T, AP>>(ptr, control);
     }
 }
 
