@@ -174,9 +174,7 @@ namespace DxPtr {
             , typename Deleter = std::default_delete<T>
             , typename AP = AlignmentPolicy::Default
         >
-        requires 
-                AlignmentPolicy::interface<T, AP>
-            and (std::is_same_v<Deleter, std::default_delete<T>> or std::is_rvalue_reference_v<Deleter>)
+        requires AlignmentPolicy::interface<T, AP>
         class omni_block final 
         : Deleter
         , array_base<std::is_unbounded_array_v<T> and IsConjoined>
@@ -235,7 +233,7 @@ namespace DxPtr {
 
             omni_block(pointer ptr, Deleter deleter)
             requires (not IsDefaultDeleter)
-            : Deleter(std::move(deleter)), omni_block_base(ptr) { }
+            : Deleter(std::move(deleter)), omni_block_base(reinterpret_cast<uintptr_t>(ptr)) { }
           
             pointer get() const noexcept { return reinterpret_cast<pointer>(originalPointer); }
 
@@ -412,10 +410,31 @@ namespace DxPtr {
                 // std::cout << "Created solo control block at " << control << "\n";
             }
 
+            // Raw pointer with deleter constructor
+            template<typename Deleter>
+            explicit omni_ptr(pointer ptr, Deleter deleter)
+            requires IsOwning and std::is_nothrow_move_constructible_v<Deleter>
+                and requires(T* ptr, Deleter deleter) {
+                    { deleter(ptr) } noexcept;
+                }
+            : omni_ptr(ptr, new control_t<false, Deleter>(ptr, deleter)) { }
+
             // Raw pointer converting constructor
             template<typename Y>
             requires IsOwning and std::convertible_to<Y*, pointer>
             explicit omni_ptr(Y* ptr) : omni_ptr(static_cast<pointer>(ptr)) { }
+
+            // Raw pointer converting with deleter constructor
+            template<typename Y, typename Deleter>
+            requires 
+                    IsOwning 
+                and std::convertible_to<Y*, pointer> 
+                and std::is_nothrow_move_constructible_v<Deleter>
+                and requires(T* ptr, Deleter deleter) {
+                    { deleter(ptr) } noexcept;
+                }
+            explicit omni_ptr(Y* ptr, Deleter deleter)
+            : omni_ptr(static_cast<pointer>(ptr), std::move(deleter)) { }
 
             // Copy constructor
             omni_ptr(const omni_ptr& copy) noexcept

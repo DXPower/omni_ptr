@@ -19,6 +19,20 @@ struct Aliaser {
     }
 };
 
+template<typename T, bool Deallocate = false>
+struct CustomDeleter {
+    const T** deleted;
+    int* count;
+
+    void operator()(T* ptr) noexcept {
+        *deleted = ptr;
+        (*count)++;
+
+        if constexpr (Deallocate)
+            delete ptr;
+    }
+};
+
 TEST_CASE("Aliasing constructor", "[advanced][lifetime]") {
     TickerInfo aliaserInfo, tickerInfo;
 
@@ -102,4 +116,41 @@ TEST_CASE("Aliasing constructor", "[advanced][lifetime]") {
 
     REQUIRE(aliaserInfo == destroyed<>);
     REQUIRE(tickerInfo == destroyed<>);
+}
+
+TEMPLATE_TEST_CASE("Custom deleter", "[advanced][lifetime][deleter]", int, std::string) {
+    int count = 0;
+
+    SECTION("Generic types") {
+        TestType* ptr = new TestType();
+        const TestType* deleted = nullptr;
+
+        omni_ptr<TestType> owner(ptr, CustomDeleter<TestType, true>{ &deleted, &count });
+
+        REQUIRE(owner.get() == ptr);
+        REQUIRE(owner.use_count() == 1);
+
+        owner.reset();
+
+        REQUIRE(ptr == deleted);
+        REQUIRE(count == 1);
+    }
+
+    SECTION("Ticker") {
+        TickerInfo info{};
+        Ticker* ptr = new Ticker(info, "A");
+        const Ticker* deleted = nullptr;
+
+        omni_ptr<Ticker> owner(ptr, CustomDeleter<Ticker, true>{ &deleted, &count });
+
+        REQUIRE(owner.get() == ptr);
+        REQUIRE(owner.use_count() == 1);
+        REQUIRE(info == constructed<>);
+
+        owner.reset();
+
+        REQUIRE(ptr == deleted);
+        REQUIRE(count == 1);
+        REQUIRE(info == destroyed<>);
+    }
 }
