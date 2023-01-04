@@ -101,6 +101,22 @@ struct Derived final : Base {
 
 struct Unrelated { };
 
+struct ArrayTicker {
+    inline static TickerInfo info{};
+
+    ArrayTicker() {
+        info.constructed++;
+    }
+
+    ~ArrayTicker() {
+        info.destroyed++;
+    }
+
+    static void Reset() {
+        info = TickerInfo{};
+    }
+};
+
 template<int N = 1>
 constexpr TickerInfo constructed {
     .constructed = N

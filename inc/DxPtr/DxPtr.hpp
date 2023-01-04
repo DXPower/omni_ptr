@@ -14,6 +14,7 @@
 #include <compare>
 #include <iosfwd>
 #include <functional>
+#include <optional>
 
 // #ifdef _MSC_VER
 // #include <malloc.h>
@@ -22,9 +23,12 @@
 // #define DXPTR_NOMSVC_CONSTEXPR constexpr
 // #endif
 
-#define OMNI_PTR_ERROR_COPY_CONVERT_OWNING \
+#define OMNI_ERROR_PTR_ERROR_COPY_CONVERT_OWNING \
     "Can only use copying conversion functions with non-owning omni_ptrs. " \
     "(did you mean to use std::move or omni_view/omni_ref?)"
+
+#define OMNI_ERROR_BOUNDED_MAKE_OMNI \
+    "Cannot use make_omni with bounded array types (T[N])"
 
 namespace DxPtr {
     namespace detail {
@@ -71,17 +75,17 @@ namespace DxPtr {
 
         template<typename T, typename Policy>
         requires interface<T, Policy>
-        std::size_t get_stored_size() = delete;
+        constexpr std::size_t get_stored_size() = delete;
 
         template<typename T, typename Policy>
         requires (interface<T, Policy> and not std::is_unbounded_array_v<T>)
-        consteval std::size_t get_stored_size() {
+        constexpr std::size_t get_stored_size() {
             using namespace detail;
 
             if constexpr (std::is_bounded_array_v<T>)
                 return std::extent_v<T> * round_up_to_nearest_multiple(
                       sizeof(std::remove_extent_t<T>)
-                    , Policy{}.get_alignment()
+                    , Policy{}.template get_alignment<std::remove_extent_t<T>>()
                 );
             else
                 return sizeof(T);
@@ -89,11 +93,11 @@ namespace DxPtr {
 
         template<typename T, typename Policy>
         requires interface<T, Policy> and std::is_unbounded_array_v<T>
-        consteval std::size_t get_stored_size(std::size_t num) {
+        constexpr std::size_t get_stored_size(std::size_t num) {
             using namespace detail;
             return num * round_up_to_nearest_multiple(
                   sizeof(std::remove_extent_t<T>)
-                , Policy{}.get_alignment()
+                , static_cast<std::size_t>(Policy{}.template get_alignment<std::remove_extent_t<T>>())
             );
         }
     }
@@ -156,6 +160,14 @@ namespace DxPtr {
             }
         };
 
+        template<bool E>
+        struct array_base { };
+
+        template<>
+        struct array_base<true> {
+            std::size_t array_size;
+        };
+
         template<
               typename T
             , bool IsConjoined = false
@@ -165,8 +177,12 @@ namespace DxPtr {
         requires 
                 AlignmentPolicy::interface<T, AP>
             and (std::is_same_v<Deleter, std::default_delete<T>> or std::is_rvalue_reference_v<Deleter>)
-        class omni_block final : Deleter, public omni_block_base {
+        class omni_block final 
+        : Deleter
+        , array_base<std::is_unbounded_array_v<T> and IsConjoined>
+        , public omni_block_base {
             static constexpr bool IsDefaultDeleter = std::is_same_v<Deleter, std::default_delete<T>>;
+            static constexpr bool IsStoringArray = std::is_array_v<T>;
 
             struct allocation {
                 std::align_val_t alignment;
@@ -210,62 +226,61 @@ namespace DxPtr {
             };
 
             public:
-            omni_block(T* ptr) 
+            using element_type = std::remove_extent_t<T>;
+            using pointer = element_type*;
+
+            omni_block(pointer ptr) 
             requires IsDefaultDeleter
             : omni_block_base(reinterpret_cast<uintptr_t>(ptr)) { }
 
-            omni_block(T* ptr, Deleter deleter)
+            omni_block(pointer ptr, Deleter deleter)
             requires (not IsDefaultDeleter)
             : Deleter(std::move(deleter)), omni_block_base(ptr) { }
           
-            T* get() const noexcept { return reinterpret_cast<T*>(originalPointer); }
+            pointer get() const noexcept { return reinterpret_cast<pointer>(originalPointer); }
 
             void call_deleter() noexcept override {
                 // If conjoined, stored T is a part of this allocation
                 // and we cannot call a regular delete on it.
                 // Must call dtor manually.
-                if constexpr (IsConjoined)
-                    get()->~T();
-                else
-                    Deleter::operator()(reinterpret_cast<T*>(originalPointer));
+                if constexpr (IsConjoined) {
+                    if constexpr (not IsStoringArray) {
+                        get()->~T();
+                    } else {
+                        for (std::size_t i = 0; i < array_base<true>::array_size; i++) {
+                            if constexpr (IsDefaultDeleter) {
+                                get()[i].~element_type();
+                            } else {
+                                std::cerr << "Not implemented deleter for arrays";
+                            }
+                        }
+                    }
+                } else {
+                    Deleter::operator()(reinterpret_cast<pointer>(originalPointer));
+                }
             }
+
 
             // Buffer looks like [Control Padding Stored] or [Stored Padding Control],
             // depending on alignment
-            static constexpr allocation get_conjoined_buffer_info() {
+            // Optional parameter for whether you care about the total size of buffer
+            // If not provided, storedRegionSize and total_size() will be incorrect.
+            // This is used for the deleter, for which this information is unnecessary
+            static constexpr allocation get_conjoined_buffer_info(std::optional<std::size_t> storedSize) {
                 auto alignControl = static_cast<std::align_val_t>(alignof(omni_block));
                 auto alignT = AP{}.template get_alignment<T>();
-                auto alignTarget = std::max(alignControl, alignT);
 
-                std::size_t controlRegionSize, storedRegionSize;
-                std::ptrdiff_t offsetControl, offsetStored;
+                std::size_t storedRegionSize = storedSize.value_or(0);
+                std::size_t controlRegionSize = round_up_to_nearest_multiple(
+                      sizeof(omni_block)
+                    , static_cast<std::size_t>(alignT)
+                );
 
-                if (alignControl >= alignT) {
-                    // Case 1: Region 1 is Control block
-                    storedRegionSize = AlignmentPolicy::get_stored_size<T, AP>();
-                    controlRegionSize = round_up_to_nearest_multiple(
-                          sizeof(omni_block)
-                        , (std::size_t) alignT
-                    );
-
-                    offsetControl = 0;
-                    offsetStored = controlRegionSize;
-                } else {
-                    // Case 2: Region 1 is Stored block
-                    // get_stored_size may add padding if the stored type
-                    // is an array
-                    storedRegionSize = round_up_to_nearest_multiple(
-                          AlignmentPolicy::get_stored_size<T, AP>()
-                        , (std::size_t) alignControl
-                    );
-                    controlRegionSize = sizeof(omni_block);
-
-                    offsetControl = storedRegionSize;
-                    offsetStored = 0;
-                }
+                std::ptrdiff_t offsetControl = 0;
+                std::ptrdiff_t offsetStored = controlRegionSize;
 
                 return allocation{
-                      .alignment = alignTarget
+                      .alignment = alignControl
                     , .controlRegionSize = controlRegionSize
                     , .storedRegionSize = storedRegionSize
                     , .offsetControl = offsetControl
@@ -274,15 +289,40 @@ namespace DxPtr {
             }
 
             template<typename... Args>
-            requires IsConjoined
+            requires (IsConjoined and not IsStoringArray)
             static omni_block* make_conjoined(Args&&... args) {
-                constexpr allocation info = get_conjoined_buffer_info();
+                constexpr allocation info = get_conjoined_buffer_info(AlignmentPolicy::get_stored_size<T, AP>());
                 
                 std::byte* buffer = new (info.alignment) std::byte[info.get_total_size()];
 
                 // Create our objects in the proper locations
                 T* stored = new(buffer + info.offsetStored) T(std::forward<Args>(args)...);
                 omni_block* control = new(buffer + info.offsetControl) omni_block(stored);
+
+                // std::cout << "Created conjoined omni_block at " << control << "\n";
+                // std::cout << "Buffer location: " << (void*) buffer << "\n";
+                // std::cout << info << "\n";
+
+                return control;
+            }
+
+            static omni_block* make_conjoined(std::size_t size)
+            requires (IsConjoined and std::is_array_v<T>) {             
+                allocation info = get_conjoined_buffer_info(AlignmentPolicy::get_stored_size<T, AP>(size));
+                
+                std::byte* buffer = new (info.alignment) std::byte[info.get_total_size()];
+
+                // Create our objects in the proper locations
+                pointer stored;
+                
+                if constexpr (std::is_same_v<AP, AlignmentPolicy::Default>)
+                    stored = new(buffer + info.offsetStored) element_type[size]{};
+                else
+                    throw std::runtime_error("Unimplemented");
+
+                omni_block* control = new(buffer + info.offsetControl) omni_block(stored);
+
+                control->array_size = size;
 
                 // std::cout << "Created conjoined omni_block at " << control << "\n";
                 // std::cout << "Buffer location: " << (void*) buffer << "\n";
@@ -298,14 +338,23 @@ namespace DxPtr {
 
                 alloc->~omni_block();
                 
-                if (not IsConjoined) {
+                if constexpr (not IsConjoined) {
                     // std::cout << "Deleting non-conjoined omni_block at " << alloc << "\n";
                     ::operator delete(alloc, sizeof(omni_block));
                 } else {
-                    constexpr allocation info = get_conjoined_buffer_info();
+                    allocation info = [&]() {
+                        if constexpr (std::is_array_v<T>) {
+                            return get_conjoined_buffer_info(
+                                AlignmentPolicy::get_stored_size<T, AP>(array_base<true>::array_size)
+                            );
+                        } else {
+                            return get_conjoined_buffer_info(
+                                AlignmentPolicy::get_stored_size<T, AP>()
+                            );
+                        }
+                    }();
                     
-                    std::byte* blockLoc = reinterpret_cast<std::byte*>(alloc);
-                    std::byte* bufferBegin = info.offsetControl == 0 ? blockLoc : blockLoc - info.offsetControl;
+                    std::byte* bufferBegin = reinterpret_cast<std::byte*>(alloc);
 
                     // std::cout << "Deleting conjoined omni_block at " << alloc << "\n";
                     // std::cout << "Buffer location: " << (void*) bufferBegin << "\n";
@@ -331,8 +380,9 @@ namespace DxPtr {
         requires AlignmentPolicy::interface<T, AP>
         class omni_ptr : public weak_type_alias_provider<IsOwning, omni_ptr<T, false, AP>> {
             public:
-            using pointer = T*;
             using element_type = std::remove_extent_t<T>;
+            using pointer = element_type*;
+
             constexpr static bool is_owning = IsOwning;
 
             private:
@@ -341,12 +391,12 @@ namespace DxPtr {
             template<bool IsConjoined = false, typename Deleter = std::default_delete<T>>
             using control_t = omni_block<T, IsConjoined, Deleter, AP>;
 
-            T* data;
+            pointer data;
             control_base_t* control;
 
             // Basic constructor
             protected:
-            constexpr omni_ptr(T* ptr, control_base_t* control) : data(ptr), control(control) {
+            constexpr omni_ptr(pointer ptr, control_base_t* control) : data(ptr), control(control) {
                 // log_creation();
             }
 
@@ -356,7 +406,7 @@ namespace DxPtr {
             constexpr omni_ptr(std::nullptr_t) noexcept : omni_ptr() { }
 
             // Raw pointer constructor
-            explicit omni_ptr(T* ptr) 
+            explicit omni_ptr(pointer ptr) 
             requires IsOwning
             : omni_ptr(ptr, new control_t<>(ptr)) {
                 // std::cout << "Created solo control block at " << control << "\n";
@@ -364,8 +414,8 @@ namespace DxPtr {
 
             // Raw pointer converting constructor
             template<typename Y>
-            requires IsOwning and std::convertible_to<Y*, T*>
-            explicit omni_ptr(Y* ptr) : omni_ptr(static_cast<T*>(ptr)) { }
+            requires IsOwning and std::convertible_to<Y*, pointer>
+            explicit omni_ptr(Y* ptr) : omni_ptr(static_cast<pointer>(ptr)) { }
 
             // Copy constructor
             omni_ptr(const omni_ptr& copy) noexcept
@@ -422,7 +472,7 @@ namespace DxPtr {
 
             // Non-owning copy construct from owner or convertible pointer
             template<typename Y, bool IsOwning2, typename AP2>
-            requires (not IsOwning and std::convertible_to<Y*, T*>)
+            requires (not IsOwning and std::convertible_to<Y*, pointer>)
             omni_ptr(const omni_ptr<Y, IsOwning2, AP2>& copy) noexcept
             : omni_ptr(copy.data, copy.control) {
                 if (control != nullptr)
@@ -431,7 +481,7 @@ namespace DxPtr {
 
             // Non-owning copy assignment from owner or convertible pointer
             template<typename Y, bool IsOwning2, typename AP2>
-            requires (not IsOwning and std::convertible_to<Y*, T*>)
+            requires (not IsOwning and std::convertible_to<Y*, pointer>)
             omni_ptr& operator=(const omni_ptr<Y, IsOwning2, AP2>& copy) {
                 if (this == &copy)
                     return *this;
@@ -450,7 +500,7 @@ namespace DxPtr {
 
             // Move construct owning from owning convertible omni_ptr
             template<typename Y, typename AP2>
-            requires (IsOwning and std::convertible_to<Y*, T*>)
+            requires (IsOwning and std::convertible_to<Y*, pointer>)
             omni_ptr(omni_ptr<Y, true, AP2>&& move) noexcept
             : omni_ptr(move.data, move.control) {
                 move.data = nullptr;
@@ -459,7 +509,7 @@ namespace DxPtr {
 
             // Move assign owning from owning convertible omni_ptr
             template<typename Y, typename AP2>
-            requires (IsOwning and std::convertible_to<Y*, T*>)
+            requires (IsOwning and std::convertible_to<Y*, pointer>)
             omni_ptr& operator=(omni_ptr<Y, true, AP2>&& move) noexcept {
                 if (this == &move)
                     return *this;
@@ -476,7 +526,7 @@ namespace DxPtr {
             }
             #endif
 
-            T* get() const noexcept {
+            pointer get() const noexcept {
                 if constexpr (IsOwning)
                     return data;
                 else if (not expired())
@@ -503,12 +553,12 @@ namespace DxPtr {
                 control = nullptr;
             }
 
-            void reset(T* other)
+            void reset(pointer other)
             requires IsOwning {
                 omni_ptr(other).swap(*this);
             }
 
-            T* release() noexcept
+            pointer release() noexcept
             requires IsOwning {
                 if (control == nullptr)
                     return nullptr;
@@ -542,8 +592,15 @@ namespace DxPtr {
                 return *data;
             }
 
-            T* operator->() const noexcept {
+            pointer operator->() const noexcept {
                 return data;
+            }
+
+            element_type& operator[](std::ptrdiff_t index) const 
+            requires std::is_array_v<T> {
+                static_assert(std::is_same_v<AP, AlignmentPolicy::Default>, "Custom alignment arrays unimplemented");
+
+                return data[index];
             }
 
             operator bool() const noexcept {
@@ -555,8 +612,12 @@ namespace DxPtr {
             friend class detail::omni_ptr;
 
             template<typename T2, typename AP2, typename... Args>
-            requires detail::correct_constructor_args<T2, Args...>
+            requires (not std::is_array_v<T2> and detail::correct_constructor_args<T2, Args...>)
             friend DxPtr::omni_ptr<T2, AP2> DxPtr::make_omni(Args&&... args);
+
+            template<typename T2, typename AP2>
+            requires std::is_array_v<T2>
+            friend DxPtr::omni_ptr<T2, AP2> DxPtr::make_omni(std::size_t size);
 
             template<typename Ptr, typename T2>
             friend Ptr make_omni_ptr_raw(T2*, omni_block_base*);
@@ -657,10 +718,10 @@ namespace DxPtr {
                std::is_same_v<Ptr<T, AP>, DxPtr::omni_view<T, AP>> 
             or std::is_same_v<Ptr<T, AP>, DxPtr::omni_ref<T, AP>>;
 
-    }
+    }    
 
     template<typename T, typename AP = AlignmentPolicy::Default, typename... Args>
-    requires detail::correct_constructor_args<T, Args...>
+    requires (not std::is_array_v<T> and detail::correct_constructor_args<T, Args...>)
     omni_ptr<T, AP> make_omni(Args&&... args) {
         using omni_ptr_t = omni_ptr<T, AP>;
         using control_t = typename omni_ptr_t::template control_t<true>;
@@ -670,9 +731,22 @@ namespace DxPtr {
         return omni_ptr_t(omni_block->get(), omni_block);
     }
 
+    template<typename T, typename AP = AlignmentPolicy::Default>
+    requires std::is_array_v<T>
+    omni_ptr<T, AP> make_omni(std::size_t size) {
+        static_assert(std::is_unbounded_array_v<T>, OMNI_ERROR_BOUNDED_MAKE_OMNI);
+
+        using omni_ptr_t = omni_ptr<T, AP>;
+        using control_t = typename omni_ptr_t::template control_t<true>;
+
+        auto* omni_block = control_t::make_conjoined(size);
+
+        return omni_ptr_t(omni_block->get(), omni_block);
+    }
+
     template<typename T, template<typename, typename> typename Ptr, typename U, typename AP>
     Ptr<T, AP> static_pointer_cast(const Ptr<U, AP>& other) {
-        static_assert(detail::IsWeakOmni<Ptr, U, AP>, OMNI_PTR_ERROR_COPY_CONVERT_OWNING);
+        static_assert(detail::IsWeakOmni<Ptr, U, AP>, OMNI_ERROR_PTR_ERROR_COPY_CONVERT_OWNING);
 
         if (not other)
             return {};
@@ -701,7 +775,7 @@ namespace DxPtr {
 
     template<typename T, template<typename, typename> typename Ptr, typename U, typename AP>
     Ptr<T, AP> dynamic_pointer_cast(const Ptr<U, AP>& other) {
-        static_assert(detail::IsWeakOmni<Ptr, U, AP>, OMNI_PTR_ERROR_COPY_CONVERT_OWNING);
+        static_assert(detail::IsWeakOmni<Ptr, U, AP>, OMNI_ERROR_PTR_ERROR_COPY_CONVERT_OWNING);
 
         if constexpr (not std::is_class_v<T>) 
             return {};
@@ -740,7 +814,7 @@ namespace DxPtr {
 
     template<typename T, template<typename, typename> typename Ptr, typename U, typename AP>
     auto const_pointer_cast(const Ptr<U, AP>& other) {
-        static_assert(detail::IsWeakOmni<Ptr, U, AP>, OMNI_PTR_ERROR_COPY_CONVERT_OWNING);
+        static_assert(detail::IsWeakOmni<Ptr, U, AP>, OMNI_ERROR_PTR_ERROR_COPY_CONVERT_OWNING);
         
         using ResultPtr = std::conditional_t<
               std::is_const_v<T>
@@ -785,7 +859,7 @@ namespace DxPtr {
 
     template<typename T, template<typename, typename> typename Ptr, typename U, typename AP>
     Ptr<T, AP> reinterpret_pointer_cast(const Ptr<U, AP>& other) {
-        static_assert(detail::IsWeakOmni<Ptr, U, AP>, OMNI_PTR_ERROR_COPY_CONVERT_OWNING);
+        static_assert(detail::IsWeakOmni<Ptr, U, AP>, OMNI_ERROR_PTR_ERROR_COPY_CONVERT_OWNING);
 
         if (not other)
             return {};
