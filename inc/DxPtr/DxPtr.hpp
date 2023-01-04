@@ -519,6 +519,21 @@ namespace DxPtr {
                 return *this;
             }
 
+            // Aliasing constructor of owning from moved owning omni_ptr
+            template<typename Y, bool O2, typename AP2>
+            requires IsOwning and O2
+            omni_ptr(omni_ptr<Y, O2, AP2>&& move, pointer alias) noexcept : omni_ptr(alias, move.control) {
+                move.data = nullptr;
+                move.control = nullptr;
+            }
+
+            // Aliasing constructor of non-owning from any omni_ptr
+            template<typename Y, bool O2, typename AP2>
+            requires (not IsOwning)
+            omni_ptr(const omni_ptr<Y, O2, AP2>& other, pointer alias) noexcept : omni_ptr(alias, other.control) {
+                control->increment();
+            }
+
             #ifdef _DEBUG
             void log_creation() const {
                 // std::cout << "created omni_ptr " << (IsOwning ? "(owning)" : "(not owning)")
@@ -575,7 +590,7 @@ namespace DxPtr {
             }
 
             long use_count() const noexcept {
-                if (data == nullptr)
+                if (control == nullptr)
                     return 0;
 
                 // Long return type to match std::shared_ptr
@@ -604,7 +619,10 @@ namespace DxPtr {
             }
 
             operator bool() const noexcept {
-                return data != nullptr;
+                if constexpr (IsOwning)
+                    return data != nullptr;
+                else
+                    return not expired();
             }
 
             template<typename T2, bool IsOwning2, typename AP2>

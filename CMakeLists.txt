@@ -58,6 +58,7 @@ FetchContent_MakeAvailable(Catch2)
 add_executable(tests)
 
 target_sources(tests PRIVATE
+  tests/AdvancedUse.cpp
   tests/Arrays.cpp
   tests/BasicUse.cpp
   tests/Conversions.cpp
