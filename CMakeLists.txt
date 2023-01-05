@@ -22,8 +22,8 @@ if(MSVC)
   target_compile_options(common_settings INTERFACE /W4 /WX)
   target_link_options(common_settings INTERFACE /DEBUG)
 else()
-  target_compile_options(common_settings INTERFACE -Wall -Wextra -Werror -fno-omit-frame-pointer -fcolor-diagnostics -fansi-escape-codes)
-  target_link_options(common_settings INTERFACE -fno-omit-frame-pointer -fcolor-diagnostics -fansi-escape-codes)
+  target_compile_options(common_settings INTERFACE -O0 -Wall -Wextra -Werror -fno-omit-frame-pointer -fcolor-diagnostics -fansi-escape-codes)
+  target_link_options(common_settings INTERFACE -O0 -fno-omit-frame-pointer -fcolor-diagnostics -fansi-escape-codes)
 endif()
 
 add_compile_definitions($<$<CONFIG:Debug>:_ITERATOR_DEBUG_LEVEL=1>)
@@ -59,6 +59,7 @@ add_executable(tests)
 
 target_sources(tests PRIVATE
   tests/AdvancedUse.cpp
+  tests/Alignment.cpp
   tests/Arrays.cpp
   tests/BasicUse.cpp
   tests/Conversions.cpp

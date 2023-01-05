@@ -2,7 +2,6 @@
 
 #include "DxPtr.hpp"
 #include <compare>
-#include <crtdbg.h>
 #include <cstddef>
 #include <memory>
 #include <type_traits>
@@ -16,12 +15,9 @@
 #include <functional>
 #include <optional>
 
-// #ifdef _MSC_VER
-// #include <malloc.h>
-// #define DXPTR_NOMSVC_CONSTEXPR
-// #else
-// #define DXPTR_NOMSVC_CONSTEXPR constexpr
-// #endif
+#ifdef _MSC_VER
+#include <malloc.h>
+#endif
 
 #define OMNI_ERROR_PTR_ERROR_COPY_CONVERT_OWNING \
     "Can only use copying conversion functions with non-owning omni_ptrs. " \
@@ -42,6 +38,30 @@ namespace DxPtr {
                 return toRound;
 
             return toRound + multiple - remainder;
+        }
+
+        inline void* aligned_alloc(std::align_val_t alignment, std::size_t size) {
+            #if defined(_MSVC_VER) || defined(_MSVC_STL_VERSION)
+                #ifdef _DEBUG
+                    return _aligned_malloc_dbg(size, static_cast<std::size_t>(alignment), __FILE__, __LINE__);
+                #else
+                    return _aligned_malloc(size, static_cast<std::size_t>(alignment));
+                #endif
+            #else
+                return std::aligned_alloc(static_cast<std::size_t>(alignment), size);
+            #endif
+        }
+
+        inline void aligned_free(void* ptr) {
+            #if defined(_MSVC_VER) || defined(_MSVC_STL_VERSION)
+                #ifdef _DEBUG
+                    _aligned_free_dbg(ptr);
+                #else
+                    _aligned_free(ptr);
+                #endif
+            #else
+                std::free(ptr);
+            #endif
         }
     }
 
@@ -267,6 +287,8 @@ namespace DxPtr {
             static constexpr allocation get_conjoined_buffer_info(std::optional<std::size_t> storedSize) {
                 auto alignControl = static_cast<std::align_val_t>(alignof(omni_block));
                 auto alignT = AP{}.template get_alignment<T>();
+                auto alignTarget = std::max(alignControl, alignT);
+
 
                 std::size_t storedRegionSize = storedSize.value_or(0);
                 std::size_t controlRegionSize = round_up_to_nearest_multiple(
@@ -278,7 +300,7 @@ namespace DxPtr {
                 std::ptrdiff_t offsetStored = controlRegionSize;
 
                 return allocation{
-                      .alignment = alignControl
+                      .alignment = alignTarget
                     , .controlRegionSize = controlRegionSize
                     , .storedRegionSize = storedRegionSize
                     , .offsetControl = offsetControl
@@ -291,7 +313,8 @@ namespace DxPtr {
             static omni_block* make_conjoined(Args&&... args) {
                 constexpr allocation info = get_conjoined_buffer_info(AlignmentPolicy::get_stored_size<T, AP>());
                 
-                std::byte* buffer = new (info.alignment) std::byte[info.get_total_size()];
+                // std::byte* buffer = new (info.alignment) std::byte[info.get_total_size()];
+                std::byte* buffer = static_cast<std::byte*>(detail::aligned_alloc(info.alignment, info.get_total_size()));
 
                 // Create our objects in the proper locations
                 T* stored = new(buffer + info.offsetStored) T(std::forward<Args>(args)...);
@@ -308,8 +331,9 @@ namespace DxPtr {
             requires (IsConjoined and std::is_array_v<T>) {             
                 allocation info = get_conjoined_buffer_info(AlignmentPolicy::get_stored_size<T, AP>(size));
                 
-                std::byte* buffer = new (info.alignment) std::byte[info.get_total_size()];
-
+                // std::byte* buffer = new (info.alignment) std::byte[info.get_total_size()];
+                std::byte* buffer = static_cast<std::byte*>(detail::aligned_alloc(info.alignment, info.get_total_size()));
+               
                 // Create our objects in the proper locations
                 pointer stored;
                 
@@ -340,25 +364,25 @@ namespace DxPtr {
                     // std::cout << "Deleting non-conjoined omni_block at " << alloc << "\n";
                     ::operator delete(alloc, sizeof(omni_block));
                 } else {
-                    allocation info = [&]() {
-                        if constexpr (std::is_array_v<T>) {
-                            return get_conjoined_buffer_info(
-                                AlignmentPolicy::get_stored_size<T, AP>(array_base<true>::array_size)
-                            );
-                        } else {
-                            return get_conjoined_buffer_info(
-                                AlignmentPolicy::get_stored_size<T, AP>()
-                            );
-                        }
-                    }();
+                    // allocation info = [&]() {
+                    //     if constexpr (std::is_array_v<T>) {
+                    //         return get_conjoined_buffer_info(
+                    //             AlignmentPolicy::get_stored_size<T, AP>(array_base<true>::array_size)
+                    //         );
+                    //     } else {
+                    //         return get_conjoined_buffer_info(
+                    //             AlignmentPolicy::get_stored_size<T, AP>()
+                    //         );
+                    //     }
+                    // }();
                     
-                    std::byte* bufferBegin = reinterpret_cast<std::byte*>(alloc);
-
+                    // std::byte* bufferBegin = reinterpret_cast<std::byte*>(alloc);
+                    detail::aligned_free(alloc);
                     // std::cout << "Deleting conjoined omni_block at " << alloc << "\n";
                     // std::cout << "Buffer location: " << (void*) bufferBegin << "\n";
                     // std::cout << info << "\n";
 
-                    ::operator delete(bufferBegin, info.get_total_size(), info.alignment);
+                    // ::operator delete(bufferBegin, info.get_total_size(), info.alignment);
                 }
             }
         };
@@ -413,10 +437,10 @@ namespace DxPtr {
             // Raw pointer with deleter constructor
             template<typename Deleter>
             explicit omni_ptr(pointer ptr, Deleter deleter)
-            requires IsOwning and std::is_nothrow_move_constructible_v<Deleter>
-                and requires(T* ptr, Deleter deleter) {
-                    { deleter(ptr) } noexcept;
-                }
+            requires
+                    IsOwning
+                and std::is_nothrow_move_constructible_v<Deleter>
+                and std::is_nothrow_invocable_v<Deleter, T*> 
             : omni_ptr(ptr, new control_t<false, Deleter>(ptr, deleter)) { }
 
             // Raw pointer converting constructor
@@ -430,9 +454,7 @@ namespace DxPtr {
                     IsOwning 
                 and std::convertible_to<Y*, pointer> 
                 and std::is_nothrow_move_constructible_v<Deleter>
-                and requires(T* ptr, Deleter deleter) {
-                    { deleter(ptr) } noexcept;
-                }
+                and std::is_nothrow_invocable_v<Deleter, T*> 
             explicit omni_ptr(Y* ptr, Deleter deleter)
             : omni_ptr(static_cast<pointer>(ptr), std::move(deleter)) { }
 
